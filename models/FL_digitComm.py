@@ -1,20 +1,21 @@
 # called by Net_Trainer.py
-import torch.nn as nn
-import torch
-import random
-import numpy as np
 import os
 import time
-import copy
-from copy import deepcopy
-from scipy.io import savemat
+import pickle
+import glob
+import numpy as np
+import torch
+import torch.nn as nn
+
 from torch.utils.data import DataLoader
 from torch import optim
 from torch.autograd import Variable
-from data_loader import get_data_loaders
+from copy import deepcopy
+from utils.data_loader import get_data_loaders
+from models.nets.CNN import CNN
 
 
-class DeepNet:
+class FLDigitComm:
     def __init__(self, args, dataset_train, dataset_test):
         self.train_loader = get_data_loaders(args.batch_size, args.user_num, dataset_train)
         self.test_loader = DataLoader(dataset_test, batch_size=args.batch_size, shuffle=True)
@@ -76,16 +77,17 @@ class DeepNet:
         iterPerEpoch = len(self.train_loader["0"])
         loss_log = torch.zeros((self.args.epochs * iterPerEpoch, 1))
 
-        self.optimizer = []
+        self.optimizer_list = []
         for model in self.model_list:
-            self.optimizer.append(optim.SGD(model.parameters(), lr=self.args.learning_rate))
+            self.optimizer_list.append(optim.SGD(model.parameters(), lr=self.args.learning_rate))
 
         cnt = 0
         self.bit_error = 0
         self.cnt_error = 1e-16  # to avoid division by zero
         accuracy_list = []
         bit_error_list = []
-        for epoch in range(self.args.epochs):
+        self.load_model() # if any model checkpoints exists, it resumes the training 
+        for self.epoch in range(self.start_epoch, self.args.epochs):
             for i in range(iterPerEpoch):
                 running_loss = []
                 for k in range(self.args.user_num):
@@ -97,18 +99,18 @@ class DeepNet:
                     net_output = self.model_list[k](b_x)[0]  # net_output dim: (batch, user_num)
                     loss = self.loss_fun(net_output, b_y)
 
-                    self.optimizer[k].zero_grad()
+                    self.optimizer_list[k].zero_grad()
                     loss.backward()
-                    self.optimizer[k].step()
+                    self.optimizer_list[k].step()
 
                     running_loss.append(loss.item())
 
                 accuracy = 0
                 if i % self.args.aggregation_intv == 0:  # aggregate every aggregation_intv iterations
                     if self.args.dynamic_QAM:  # adjust accordingly (this adjusts BER during training iterations)
-                        if epoch <= 1:
+                        if self.epoch <= 1:
                             self.args.QAM_size = 16
-                        elif epoch == 2:
+                        elif self.epoch == 2:
                             self.args.QAM_size = 8
                         else:
                             self.args.QAM_size = 4
@@ -125,7 +127,7 @@ class DeepNet:
                     bit_error_list.append(self.bit_error/self.cnt_error)
                     cnt += 1
                     print(
-                        f"Iter {cnt}-{epoch + 1}/{self.args.epochs}   "
+                        f"Iter {cnt}-{self.epoch + 1}/{self.args.epochs}   "
                         f"Loss (Train): {running_loss_mean:.4f}    "
                         f"BER: {(self.bit_error/self.cnt_error):.3f}     "
                         f"Accuracy: {accuracy_list[-1]:.3f}     ",
@@ -143,33 +145,20 @@ class DeepNet:
             QAM = 'NA'  # analog communication model
 
         end_time = time.time()
+       
+        # saving the results
+        save_dict = {'loss': loss_log.numpy(), 'acc': np.array(accuracy_list), 'bit': np.array(bit_error_list)}
+        file_name = 'results_' + self.args.name + '_opt_' + str(self.args.user_num) + 'a_32L_' + str(self.args.noise_level) + 'dB_' + QAM + 'Q.pkl'
+        with open(os.path.join(self.args.log_dir, file_name), 'wb') as f:
+            pickle.dump(save_dict, f)
 
-        saving_path = self.args.path + 'results/'
-        if not os.path.exists(saving_path):
-            os.mkdir(saving_path)
-
-        mdic_loss = {'loss': loss_log.numpy()}  # trainig loss
-        savemat(saving_path + self.args.name + '_opt_' + str(self.args.user_num) + 'a_32L_' + str(self.args.noise_level) + 'dB_' + QAM + 'Q_even_' + str(self.args.seed_idx) + '.mat', mdic_loss)
-
-        mdic_loss = {'acc': np.array(accuracy_list)}
-        savemat(saving_path + self.args.name + '_acc_' + str(self.args.user_num) + 'a_32L_' + str(self.args.noise_level) + 'dB_' + QAM + 'Q_even_' + str(self.args.seed_idx) + '.mat', mdic_loss)
-
-        mdic_loss = {'bit': np.array(bit_error_list)}
-        savemat(saving_path + self.args.name + '_bit_' + str(self.args.user_num) + 'a_32L_' + str(self.args.noise_level) + 'dB_' + QAM + 'Q_even_' + str(self.args.seed_idx) + '.mat', mdic_loss)
-
-        self.model.training_flag = True
+        self.save_model() # saving the checkpoints
         print(f"\nTraining time: {end_time - start_time:.4f}")
 
-    def test(self):
-        if self.model.training_flag:  # if the model is already trained
-            self.model.eval()
-        elif os.path.exists(self.args.path + "model_run_" + str(self.args.run_index)):
-            self.model = torch.load(self.args.path + "model_run_" + str(self.args.run_index))
-            self.model.eval()
-        else:
-            raise Exception("no trained model found!")
-
+    def test(self, verbose=False):
+        self.model.eval()
         accuracy = 0
+        
         with torch.no_grad():
             for i, (images, labels) in enumerate(self.test_loader):
                 test_output, _ = self.model(images)
@@ -178,12 +167,38 @@ class DeepNet:
 
         accuracy /= i+1
         self.model.train()
+        if verbose:
+            print(f"The accuracy of model is {accuracy}%")
+
         return accuracy
+    
+    def save_model(self):
+        file_dir = os.path.join(self.args.log_dir, "checkpoints")
+        file_name = os.path.join(file_dir,  f"checkpoint_{self.epoch}.pt")
+        if not os.path.exists(file_dir):
+            os.mkdir(file_dir)
+        torch.save({
+            'epoch': self.epoch,
+            'model_state_dict': [model.state_dict() for model in self.model_list],
+            'optimizer_state_dict': [optimizer.state_dict() for optimizer in self.optimizer_list],
+            }, file_name)
+        
+    def load_model(self):
+        pattern = os.path.join(self.args.log_dir, "checkpoints", "**", f"*.pt")
+        chkpt = glob.glob(pattern, recursive=True)
+
+        if len(chkpt) > 0:
+            checkpoint = torch.load(chkpt[-1]) # the latest checkpoint is picked
+            for i in range(len(self.model_list)):
+                self.model_list[i].load_state_dict(checkpoint['model_state_dict'][i])
+                self.optimizer_list[i].load_state_dict(checkpoint['optimizer_state_dict'][i])
+        
+            self.start_epoch = checkpoint['epoch']
+        else:
+            self.start_epoch = 0
 
     def aggregate_models(self):
-        self.model.training_flag = True
         user_num = self.args.user_num
-        learning_rate = self.optimizer[0].param_groups[0]["lr"]
 
         model_list = []
         for i in range(user_num):
@@ -316,35 +331,3 @@ class DeepNet:
                 binary_stream += bin(np.argmin((item[1] - self.QAM_inplace)**2))[2:].zfill(int(np.log2(self.QAM_size)/2))
 
         return binary_stream
-
-
-class CNN(nn.Module):  # DNN (modify it accordingly)
-    def __init__(self, args):
-        super(CNN, self).__init__()
-        self.args = args
-        self.training_flag = False
-
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(
-                in_channels=1,
-                out_channels=16,
-                kernel_size=5,
-                stride=1,
-                padding=2,
-            ),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2),
-        )
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(16, 32, 5, 1, 2),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-        )
-        self.out = nn.Linear(32 * 7 * 7, 10)
-
-    def forward(self, x):
-        x = self.conv1(x)
-        x = self.conv2(x)
-        x = x.view(x.size(0), -1)
-        output = self.out(x)
-        return output, x    # return x for visualization

@@ -1,29 +1,28 @@
 # %% Main function
-from config import Parameter_config, set_seed
-from Net_Trainer import Trainer
 import os
+import sys
 import numpy as np
+from utils.config import Parameter_config, set_seed
+from utils.trainer import Trainer
 
+parent_dir = os.path.dirname(os.path.abspath(__file__))
+if parent_dir not in sys.path:
+    sys.path.append(parent_dir)
 
-def main():
-    path = os.path.dirname(os.path.abspath(__file__)) + '/'
-    os.chdir(path)
+os.chdir(parent_dir)
+os.environ["PROJECT_ROOT"] = parent_dir
 
+def main(args):
     seed_num = 10  # number of repeats with different seeds
-    configer = Parameter_config()
-    runs_num = configer.get_search_size()  # set different parameters and their default values in config.py
 
-    for s in range(seed_num):
+    for _ in range(seed_num):
         seed = np.random.randint(1000)
         print(f"seed: {seed}")
-        for i in range(runs_num):
-            set_seed(seed)
-            configer.update_args(seed, s)
+        set_seed(seed)
 
-            instance = Trainer(configer.args)
-            instance.run()  # runs training and testing
-        configer.reset()
-
+        instance = Trainer(args)
+        instance.run()  # runs training and testing
 
 if __name__ == "__main__":
-    main()
+    configer = Parameter_config(parent_dir)
+    main(configer.args)
